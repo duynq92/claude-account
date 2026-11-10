@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# claude-account — bind a Claude Code account to a project directory.
+#
+# Each account is an isolated CLAUDE_CONFIG_DIR under $CLAUDE_ACCOUNTS_HOME
+# (default ~/.claude-accounts/<name>). Claude Code keeps a separate keychain
+# credential per config dir, so accounts never overwrite each other.
+# A project is bound by a `.claude-account` file; the nearest one walking up
+# from $PWD wins. The reserved account "default" means plain ~/.claude.
+set -euo pipefail
+
+ACCOUNTS_HOME="${CLAUDE_ACCOUNTS_HOME:-$HOME/.claude-accounts}"
+BIND_FILE=".claude-account"
+DEFAULT_DIR="$HOME/.claude"
+# Shared from ~/.claude into every account so settings/skills/plugins stay in sync.
+SHARED=(CLAUDE.md settings.json keybindings.json agents commands skills hooks plugins scripts)
+
+die() { echo "claude-account: $*" >&2; exit 1; }
+
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "invalid account name '$1' (allowed: A-Z a-z 0-9 _ -)"
+}
+
+account_dir() {
+  if [[ "$1" == default ]]; then echo "$DEFAULT_DIR"; else echo "$ACCOUNTS_HOME/$1"; fi
+}
+
+state_file() {
+  if [[ "$1" == default ]]; then echo "$HOME/.claude.json"; else echo "$(account_dir "$1")/.claude.json"; fi
+}
+
+require_account() {
+  valid_name "$1"
+  [[ "$1" == default || -d "$(account_dir "$1")" ]] || die "unknown account '$1' (run: claude-account add $1)"
+}
+
+email_of() {
+  local f; f="$(state_file "$1")"
+  [[ -f "$f" ]] || { echo "(not logged in)"; return; }
+  local e; e="$(jq -r '.oauthAccount.emailAddress // empty' "$f")"
+  echo "${e:-(not logged in)}"
+}
+
+# Prints "<account>\t<source>" for directory $1.
+resolve() {
+  if [[ -n "${CLAUDE_ACCOUNT:-}" ]]; then
+    printf '%s\t%s\n' "$CLAUDE_ACCOUNT" "env CLAUDE_ACCOUNT"; return
+  fi
+  local d; d="$(cd "$1" && pwd -P)"
+  while :; do
+    if [[ -f "$d/$BIND_FILE" ]]; then
+      local name; name="$(tr -d '[:space:]' < "$d/$BIND_FILE")"
+      printf '%s\t%s\n' "$name" "$d/$BIND_FILE"; return
+    fi
+    [[ "$d" == / ]] && break
+    d="$(dirname "$d")"
+  done
+  printf '%s\t%s\n' default "(no binding)"
+}
+
+cmd_add() {
+  [[ $# -eq 1 ]] || die "usage: claude-account add <name>"
+  valid_name "$1"
+  [[ "$1" != default ]] || die "'default' is reserved for ~/.claude"
+  local dir; dir="$(account_dir "$1")"
+  [[ ! -e "$dir" ]] || die "account '$1' already exists at $dir"
+  mkdir -p "$dir"
+  local item
+  for item in "${SHARED[@]}"; do
+    [[ -e "$DEFAULT_DIR/$item" ]] && ln -s "$DEFAULT_DIR/$item" "$dir/$item"
+  done
+  echo "Created account '$1' at $dir"
+  echo "Log in with: claude-account login $1"
+}
+
+cmd_login() {
+  [[ $# -eq 1 ]] || die "usage: claude-account login <name>"
+  require_account "$1"
+  echo "Starting Claude Code for account '$1'. Run /login inside if it does not prompt you." >&2
+  run_claude "$1"
+}
+
+cmd_list() {
+  local here; here="$(resolve "$PWD" | cut -f1)"
+  local names=(default) d
+  if [[ -d "$ACCOUNTS_HOME" ]]; then
+    for d in "$ACCOUNTS_HOME"/*/; do [[ -d "$d" ]] && names+=("$(basename "$d")"); done
+  fi
+  local n mark
+  for n in "${names[@]}"; do
+    mark=" "; [[ "$n" == "$here" ]] && mark="*"
+    printf '%s %-20s %s\n' "$mark" "$n" "$(email_of "$n")"
+  done
+}
+
+cmd_bind() {
+  [[ $# -ge 1 && $# -le 2 ]] || die "usage: claude-account bind <name> [dir]"
+  require_account "$1"
+  local dir; dir="$(cd "${2:-$PWD}" && pwd -P)"
+  echo "$1" > "$dir/$BIND_FILE"
+  # Keep the binding out of version control without touching .gitignore.
+  local gitdir
+  if gitdir="$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null)"; then
+    [[ "$gitdir" = /* ]] || gitdir="$dir/$gitdir"
+    local excl="$gitdir/info/exclude"
+    mkdir -p "$(dirname "$excl")"
+    grep -qxF "$BIND_FILE" "$excl" 2>/dev/null || echo "$BIND_FILE" >> "$excl"
+  fi
+  echo "Bound $dir -> '$1' ($(email_of "$1"))"
+}
+
+cmd_unbind() {
+  local dir; dir="$(cd "${1:-$PWD}" && pwd -P)"
+  [[ -f "$dir/$BIND_FILE" ]] || die "no $BIND_FILE in $dir"
+  rm "$dir/$BIND_FILE"
+  echo "Unbound $dir"
+}
+
+cmd_which() {
+  local name src
+  IFS=$'\t' read -r name src < <(resolve "${1:-$PWD}")
+  require_account "$name"
+  printf 'account: %s\nemail:   %s\nconfig:  %s\nsource:  %s\n' \
+    "$name" "$(email_of "$name")" "$(account_dir "$name")" "$src"
+}
+
+cmd_env() {
+  local name; name="$(resolve "$PWD" | cut -f1)"
+  require_account "$name"
+  if [[ "$name" == default ]]; then
+    echo "unset CLAUDE_CONFIG_DIR"
+  else
+    printf 'export CLAUDE_CONFIG_DIR=%q\n' "$(account_dir "$name")"
+  fi
+}
+
+run_claude() {
+  local name="$1"; shift
+  local bin; bin="$(type -P claude)" || die "claude binary not found in PATH"
+  if [[ "$name" == default ]]; then
+    exec env -u CLAUDE_CONFIG_DIR "$bin" "$@"
+  fi
+  CLAUDE_CONFIG_DIR="$(account_dir "$name")" exec "$bin" "$@"
+}
+
+cmd_run() {
+  local name; name="$(resolve "$PWD" | cut -f1)"
+  require_account "$name"
+  run_claude "$name" "$@"
+}
+
+cmd_use() {
+  [[ $# -ge 1 ]] || die "usage: claude-account use <name> [claude args...]"
+  require_account "$1"
+  run_claude "$@"
+}
+
+cmd_shell_init() {
+  cat <<'EOF'
+# Route `claude` through the project's bound account.
+claude() { command claude-account run "$@"; }
+EOF
+}
+
+usage() {
+  cat <<'EOF'
+Usage: claude-account <command> [args]
+
+  add <name>            Create an isolated account profile
+  login <name>          Launch Claude Code for that account to sign in
+  list                  List accounts (* = active for current dir)
+  bind <name> [dir]     Bind dir (default: cwd) to an account
+  unbind [dir]          Remove the binding
+  which [dir]           Show the account resolved for dir
+  run [claude args]     Run claude with the resolved account
+  use <name> [args]     Run claude with a specific account, once
+  env                   Print shell exports for the resolved account
+  shell-init            Print a `claude` wrapper function for your shell rc
+
+Resolution order: $CLAUDE_ACCOUNT, nearest .claude-account up the tree, "default".
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; [[ $# -gt 0 ]] && shift
+  case "$cmd" in
+    add) cmd_add "$@" ;;
+    login) cmd_login "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    bind) cmd_bind "$@" ;;
+    unbind) cmd_unbind "$@" ;;
+    which|status) cmd_which "$@" ;;
+    run) cmd_run "$@" ;;
+    use) cmd_use "$@" ;;
+    env) cmd_env "$@" ;;
+    shell-init) cmd_shell_init ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
